@@ -1,7 +1,7 @@
 import { ethers, upgrades } from "hardhat";
 
 async function main() {
-  const ContractFactory = await ethers.getContractFactory("MyToken");
+  const ContractFactory = await ethers.getContractFactory("EarlyAccessNFT");
 
   const instance = await upgrades.deployProxy(ContractFactory);
   await instance.waitForDeployment();

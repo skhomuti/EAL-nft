@@ -1,52 +1,108 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import {StandardMerkleTree} from "@openzeppelin/merkle-tree";
-import { ContractTransactionResponse } from "ethers";
-import {EarlyAccessNFT} from "../typechain-types";
-import {HardhatEthersSigner} from "@nomicfoundation/hardhat-ethers/signers";
+import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers"
+import * as fs from "fs";
 
 describe("EarlyAccessNFT", function () {
-  let owner: HardhatEthersSigner;
-  let otherAccount: HardhatEthersSigner;
-  let instance: EarlyAccessNFT & { deploymentTransaction(): ContractTransactionResponse; };
 
-  before(async function () {
-    const ContractFactory = await ethers.getContractFactory("EarlyAccessNFT");
-    [owner, otherAccount] = await ethers.getSigners();
+  async function deployContract() {
+    const [_, otherAccount] = await ethers.getSigners();
 
-    instance = await ContractFactory.deploy();
-    await instance.waitForDeployment();
-  });
-
-  it("Test contract", async function () {
-    expect(await instance.name()).to.equal("EarlyAccessNFT");
-  });
-
-  it('Test merkle mint', async function () {
     const secrets = [
       [ethers.encodeBytes32String("never gonna give you up")],
       [ethers.encodeBytes32String("never gonna let you down")],
+      [ethers.encodeBytes32String("never gonna run around")],
     ];
 
     const tree = StandardMerkleTree.of(secrets, ["bytes32"]);
 
-    await instance.setMerkleRoot(tree.root);
-    expect(await instance.merkleRoot()).to.equal(tree.root);
+    const nft = await ethers.deployContract("EarlyAccessNFT", [tree.root, 2]);
+    await nft.waitForDeployment();
+    return { nft, tree, secrets, otherAccount }
+  }
+
+  it("Test contract", async function () {
+    const { nft, tree } = await loadFixture(deployContract)
+    fs.writeFileSync("tree.json", JSON.stringify(tree.dump()));
+    expect(await nft.name()).to.equal("EarlyAccessNFT");
+    expect(await nft.merkleRoot()).to.equal(tree.root);
+    expect(await nft.paused()).to.equal(false);
+    expect(await nft.totalSupply()).to.equal(0);
+  });
+
+  it('Test merkle mint', async function () {
+    const { nft, tree, secrets, otherAccount } = await loadFixture(deployContract)
+
+    expect(await nft.merkleRoot()).to.equal(tree.root);
+
     const proof = tree.getProof([secrets[0][0]]);
-    const response = await instance.mint(otherAccount, proof, secrets[0][0]);
+    const response = await nft.mint(otherAccount, proof, secrets[0][0]);
     const tokenId = response.value
-    expect(await instance.balanceOf(otherAccount)).to.equal(1);
-    expect(await instance.ownerOf(tokenId)).to.equal(otherAccount.address);
+    expect(await nft.balanceOf(otherAccount)).to.equal(1);
+    expect(await nft.ownerOf(tokenId)).to.equal(otherAccount.address);
+    expect(await nft.totalSupply()).to.equal(1);
+  });
+
+  it('Test merkle mint non-owner', async function () {
+    const { nft, tree, secrets, otherAccount } = await loadFixture(deployContract)
+
+    expect(await nft.merkleRoot()).to.equal(tree.root);
+
+    const proof = tree.getProof([secrets[0][0]]);
+    const response = await nft.connect(otherAccount).mint(otherAccount, proof, secrets[0][0]);
+    const tokenId = response.value
+    expect(await nft.balanceOf(otherAccount)).to.equal(1);
+    expect(await nft.ownerOf(tokenId)).to.equal(otherAccount.address);
+    expect(await nft.totalSupply()).to.equal(1);
   });
 
   it("Test non-transferable", async function () {
-    expect(await instance.transferable()).to.equal(false);
+    const { nft, tree, secrets, otherAccount } = await loadFixture(deployContract)
 
-    expect(await instance.connect(otherAccount).transferFrom(otherAccount, otherAccount, 0))
-        .to.be.revertedWith('EarlyAccessNFT: transfers are not allowed');
+    const proof = tree.getProof([secrets[0][0]]);
+    const response = await nft.mint(otherAccount, proof, secrets[0][0]);
+    const tokenId = response.value
 
-    await expect(instance.connect(otherAccount).transferFrom(otherAccount, otherAccount, 0))
+    await expect(nft.connect(otherAccount).transferFrom(otherAccount, otherAccount, tokenId))
         .to.be.revertedWith('EarlyAccessNFT: transfers are not allowed');
+  });
+
+  it("Test mint on pause", async function () {
+    const { nft, tree, secrets, otherAccount } = await loadFixture(deployContract)
+
+    await nft.pause();
+    expect(await nft.paused()).to.equal(true);
+    expect(nft.mint(otherAccount, tree.getProof([secrets[0][0]]), secrets[0][0])).to.be.revertedWith("Pausable: paused")
+    expect(await nft.claimed(secrets[0][0])).to.equal(false)
+
+    await nft.unpause();
+    expect(await nft.paused()).to.equal(false);
+    await nft.mint(otherAccount, tree.getProof([secrets[0][0]]), secrets[0][0]);
+    expect(await nft.claimed(secrets[0][0])).to.equal(true)
+    expect(await nft.balanceOf(otherAccount)).to.equal(1);
+    expect(await nft.totalSupply()).to.equal(1);
+  });
+
+  it("Test mint more than one", async function () {
+    const { nft, tree, secrets, otherAccount } = await loadFixture(deployContract)
+
+    await nft.connect(otherAccount).mint(otherAccount, tree.getProof([secrets[0][0]]), secrets[0][0]);
+    expect(nft.connect(otherAccount).mint(otherAccount, tree.getProof([secrets[0][0]]), secrets[0][0])).to.be.revertedWith("EarlyAccessNFT: already claimed");
+
+    await nft.connect(otherAccount).mint(otherAccount, tree.getProof([secrets[1][0]]), secrets[1][0]);
+    expect(await nft.balanceOf(otherAccount)).to.equal(2);
+    expect(await nft.totalSupply()).to.equal(2);
+  });
+
+
+  it("Test mint more than maxSupply", async function () {
+    const { nft, tree, secrets, otherAccount } = await loadFixture(deployContract)
+
+    await nft.connect(otherAccount).mint(otherAccount, tree.getProof([secrets[0][0]]), secrets[0][0]);
+    await nft.connect(otherAccount).mint(otherAccount, tree.getProof([secrets[1][0]]), secrets[1][0]);
+    await expect(nft.connect(otherAccount).mint(otherAccount, tree.getProof([secrets[2][0]]), secrets[2][0])).to.be.revertedWith("EarlyAccessNFT: max supply reached");
+
   });
 
 });
